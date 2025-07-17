@@ -973,3 +973,191 @@ Invalid row, with, too, many, commas,,,,,,
     import shutil
     shutil.rmtree(temp_dir)
     print(f"\nCleaned up temporary directory: {temp_dir}")
+
+
+
+Data cleaning is a crucial step in any data analysis or machine learning project. Pandas and NumPy are foundational libraries in Python for this purpose, while SciPy and other specialized libraries offer more advanced functionalities.
+
+Here's a list of common functions and techniques for data cleaning using these libraries:
+
+Pandas Functions for Data Cleaning
+
+Pandas DataFrames are excellent for tabular data, and they provide a rich set of functions for various cleaning tasks:
+
+1. Handling Missing Values (NaN/Nulls):
+
+    df.isnull() / df.isna(): Returns a boolean DataFrame indicating missing values.
+
+    df.notnull() / df.notna(): Returns a boolean DataFrame indicating non-missing values.
+
+    df.sum(): When applied after isnull(), it counts missing values per column (e.g., df.isnull().sum()).
+
+    df.dropna(): Removes rows or columns containing missing values.
+
+        how='any' (default): Drops row/column if any NA values are present.
+
+        how='all': Drops row/column if all values are NA.
+
+        axis=0 (default): Drops rows.
+
+        axis=1: Drops columns.
+
+        inplace=True: Modifies the DataFrame in place.
+
+    df.fillna(): Fills missing values with a specified value or method.
+
+        value: A single value (e.g., 0, 'Unknown').
+
+        method='ffill' (forward fill): Propagates the last valid observation forward to next valid.
+
+        method='bfill' (backward fill): Propagates the next valid observation backward to previous valid.
+
+        df.fillna(df.mean()) / df.fillna(df.median()) / df.fillna(df.mode()[0]): Fills with mean, median, or mode of the column.
+
+        limit: Maximum number of consecutive NaNs to fill.
+
+2. Removing Duplicates:
+
+    df.duplicated(): Returns a boolean Series indicating duplicate rows (keeping the first occurrence by default).
+
+        keep='first' (default): Marks all but the first occurrence as True.
+
+        keep='last': Marks all but the last occurrence as True.
+
+        keep=False: Marks all duplicates as True.
+
+        subset: List of column names to consider for identifying duplicates.
+
+    df.drop_duplicates(): Removes duplicate rows.
+
+        subset: Same as above.
+
+        keep: Same as above.
+
+        inplace=True: Modifies the DataFrame in place.
+
+3. Correcting Data Types:
+
+    df.dtypes: Shows the data type of each column.
+
+    df.astype(dtype): Converts a column or DataFrame to a specified data type.
+
+        df['column'].astype(str)
+
+        pd.to_numeric(df['column'], errors='coerce'): Converts to numeric, replacing errors with NaN.
+
+        pd.to_datetime(df['column'], errors='coerce'): Converts to datetime objects.
+
+4. Renaming and Dropping Columns/Rows:
+
+    df.rename(columns={'old_name': 'new_name'}): Renames specific columns.
+
+    df.drop(columns=['col1', 'col2']): Drops specified columns.
+
+    df.drop(rows=[index1, index2]): Drops specified rows by index.
+
+    df.columns = ['new_col1', 'new_col2', ...]: Renames all columns by assigning a new list of names.
+
+5. String Manipulation (for text data cleaning):
+
+    df['column'].str.lower() / df['column'].str.upper(): Converts text to lowercase/uppercase.
+
+    df['column'].str.strip(): Removes leading/trailing whitespace.
+
+    df['column'].str.replace('old', 'new'): Replaces substrings.
+
+    df['column'].str.contains('pattern'): Checks if strings contain a pattern.
+
+    df['column'].str.split('delimiter'): Splits strings into lists.
+
+    df['column'].str.extract('regex'): Extracts patterns using regular expressions.
+
+6. Applying Functions for Custom Cleaning:
+
+    df.apply(func, axis=0/1): Applies a function along an axis of the DataFrame (column-wise or row-wise).
+
+    df.applymap(func): Applies a function element-wise to the DataFrame.
+
+    df['column'].map(func): Applies a function element-wise to a Series (column).
+
+7. Handling Outliers:
+
+    Pandas itself doesn't have direct outlier removal functions, but it provides the tools to implement common methods:
+
+        IQR Method: Q1 = df['col'].quantile(0.25), Q3 = df['col'].quantile(0.75), IQR = Q3 - Q1. Then filter df[(df['col'] >= (Q1 - 1.5 * IQR)) & (df['col'] <= (Q3 + 1.5 * IQR))].
+
+        Z-score Method: Can be calculated using scipy.stats.zscore (see below) and then filtering based on a threshold.
+
+8. Data Normalization/Scaling (often a preprocessing step after cleaning):
+
+    While not strictly "cleaning," it's a common step. Pandas allows for manual scaling using arithmetic operations (e.g., (df['col'] - df['col'].min()) / (df['col'].max() - df['col'].min()) for Min-Max scaling).
+
+NumPy Functions for Data Cleaning
+
+NumPy is the backbone of Pandas and provides efficient array operations that are useful for numerical data cleaning, especially when dealing with raw arrays or for more granular control.
+
+    np.nan: Represents missing numerical values.
+
+    np.isnan(array): Returns a boolean array indicating where NaN values are present.
+
+    np.isinf(array): Returns a boolean array indicating where infinite values are present.
+
+    np.nan_to_num(array, nan=0.0, posinf=None, neginf=None): Replaces NaN, positive infinity, and negative infinity with specified values.
+
+    np.where(condition, x, y): Returns elements chosen from x or y depending on condition. Useful for conditional replacement.
+
+    np.unique(array): Finds unique elements in an array. Useful for identifying categorical values or potential inconsistencies.
+
+    np.clip(array, min_val, max_val): Clips values in an array to be within a specified range. Useful for outlier capping.
+
+    np.delete(array, obj, axis): Deletes elements or slices from an array.
+
+    np.sort(array): Sorts elements in an array.
+
+Other Library Functions for Data Cleaning
+
+1. SciPy (Scientific Python):
+SciPy builds on NumPy and provides more advanced mathematical, scientific, and statistical functions, some of which are very useful for data cleaning, especially outlier detection and imputation.
+
+    scipy.stats:
+
+        scipy.stats.zscore(a): Calculates the Z-score for each element relative to the mean and standard deviation. Useful for identifying outliers.
+
+        scipy.stats.iqr(x): Computes the interquartile range (IQR).
+
+        Various distribution fitting functions for more sophisticated outlier detection or imputation based on data distribution.
+
+    scipy.interpolate:
+
+        scipy.interpolate.interp1d: Can be used for more advanced imputation techniques where missing values are interpolated based on surrounding data points.
+
+    scipy.signal:
+
+        scipy.signal.savgol_filter(): Applies a Savitzky-Golay filter to smooth data, which can help in reducing noise.
+
+2. Scikit-learn (for more advanced imputation and preprocessing):
+While primarily a machine learning library, scikit-learn offers powerful tools for preprocessing that are often considered part of the data cleaning pipeline.
+
+    sklearn.impute.SimpleImputer: Fills missing values using strategies like mean, median, most frequent, or a constant value.
+
+    sklearn.impute.KNNImputer: Imputes missing values using the K-Nearest Neighbors approach.
+
+    sklearn.preprocessing (for scaling, normalization, encoding):
+
+        MinMaxScaler, StandardScaler, RobustScaler: For numerical feature scaling.
+
+        OneHotEncoder, LabelEncoder: For encoding categorical variables.
+
+3. Specialized Libraries:
+
+    missingno: Specifically for visualizing the presence and patterns of missing data. Not a cleaning function itself, but incredibly helpful for understanding data cleanliness.
+
+    DataCleaner (third-party): Aims to automate typical data cleaning functionalities, building on Pandas.
+
+    Scrubadub: Designed to remove Personally Identifiable Information (PII) from free-form text.
+
+    PyJanitor: Extends Pandas with more convenient data cleaning methods, often through method chaining.
+
+    Ftfy: "Fixes text for you" - specifically designed to handle and fix problematic Unicode characters in text data.
+
+Choosing the right function depends on the specific data cleaning task at hand and the nature of your data. Often, a combination of these functions from different libraries is used in a typical data cleaning workflow.
