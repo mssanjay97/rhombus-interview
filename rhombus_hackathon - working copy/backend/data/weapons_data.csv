@@ -1,0 +1,9 @@
+id,type,latitude,longitude,status,last_reported_at
+1,Missile Launcher,37.7749,-122.4194,Active,2025-07-15T10:00:00Z
+2,Tank,37.7800,-122.4000,Idle,2025-07-15T10:05:00Z
+3,Artillery,37.7600,-122.4300,Active,2025-07-15T10:10:00Z
+4,Missile Launcher,37.8000,-122.4500,Maintenance,2025-07-15T09:45:00Z
+5,Drone,37.7900,-122.4200,Active,2025-07-15T10:15:00Z
+6,Drone,37.7500,-122.3900,Decommissioned,2025-07-14T15:30:00Z
+7,Tank,37.7700,-122.4050,Active,2025-07-15T10:20:00Z
+8,Artillery,37.7850,-122.4100,Active,2025-07-15T10:25:00Z

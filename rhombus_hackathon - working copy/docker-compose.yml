@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./backend:/app # Mount the backend code for development
+    environment:
+      FLASK_APP: app.py
+      FLASK_ENV: development # Enable debug mode for development
+    command: python app.py # Ensure app.py is executed
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        REACT_APP_BACKEND_URL: http://localhost:5000 # Backend service name in Docker network
+    ports:
+      - "3000:80" # Map host port 3000 to container port 80 (Nginx default)
+    depends_on:
+      - backend # Frontend depends on backend starting first
+    volumes:
+      - ./frontend:/app # Mount for development (if needed for hot-reloading setup)
+      - /app/node_modules # Exclude node_modules from host bind mount
+    # If you want hot-reloading during development within Docker, uncomment these:
+    # stdin_open: true
+    # tty: true
