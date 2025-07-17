@@ -1,0 +1,451 @@
+import pandas as pd
+import numpy as np
+import os
+import re
+import json
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from collections import defaultdict
+
+# --- Configuration and Utility Functions ---
+
+def get_data_type_info():
+    """
+    Returns a dictionary of expected data types and common patterns for defense data.
+    This is highly customizable based on your specific data domains.
+    """
+    return {
+        'timestamp': {'regex': r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z', 'format': '%Y-%m-%dT%H:%M:%SZ', 'alternates': [r'\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}', '%m/%d/%Y %H:%M:%S']},
+        'latitude': {'type': float, 'range': (-90.0, 90.0), 'precision': 4, 'regex': r'^-?\d{1,2}\.\d{4,}'},
+        'longitude': {'type': float, 'range': (-180.0, 180.0), 'precision': 4, 'regex': r'^-?\d{1,3}\.\d{4,}'},
+        'unit_id': {'type': str, 'regex': r'^[A-Z]{2,5}-\d{3,6}$', 'standard_prefix': 'UNIT'},
+        'threat_level': {'type': str, 'allowed_values': ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL', 'UNKNOWN'], 'case_normalize': True},
+        'sensor_type': {'type': str, 'allowed_values': ['RADAR', 'SONAR', 'OPTICAL', 'IR', 'OTHER'], 'case_normalize': True},
+        'status': {'type': str, 'allowed_values': ['ACTIVE', 'INACTIVE', 'DEPLOYED', 'MAINTENANCE', 'ERROR'], 'case_normalize': True},
+        'personnel_id': {'type': str, 'regex': r'^[A-Z]{1}\d{6}$', 'anonymize': True}, # Example of a field to anonymize
+        'equipment_serial': {'type': str, 'regex': r'^[A-Z0-9]{8,16}$'},
+        # Add more specific defense data types as needed
+    }
+
+def anonymize_value(value, method='pseudonymization', salt='rhombus_hackathon_salt'):
+    """
+    Anonymizes sensitive data. Common methods include:
+    - Pseudonymization (e.g., hashing)
+    - Generalization (e.g., rounding numbers, grouping categories)
+    - Suppression (removing)
+    - Tokenization
+    """
+    if pd.isna(value) or value is None:
+        return value
+
+    if method == 'pseudonymization':
+        import hashlib
+        return hashlib.sha256((str(value) + salt).encode()).hexdigest()
+    elif method == 'suppression':
+        return '[SUPPRESSED]'
+    elif method == 'generalization_date':
+        # Example: generalize date to year only
+        try:
+            date_obj = pd.to_datetime(value, errors='coerce')
+            if pd.notna(date_obj):
+                return date_obj.year
+            return value
+        except:
+            return value
+    # Add more anonymization methods as required by defense data regulations
+    return value # Return original if no method matches
+
+def infer_delimiter(file_path):
+    """
+    Infers the delimiter for CSV/TSV-like files by checking common delimiters.
+    """
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        first_line = f.readline()
+    
+    delimiters = [',', '\t', ';', '|']
+    best_delimiter = ',' # Default
+    max_count = -1
+
+    for delim in delimiters:
+        count = first_line.count(delim)
+        if count > max_count:
+            max_count = count
+            best_delimiter = delim
+    
+    if max_count == 0 and len(first_line.split()) > 1: # Maybe space-separated?
+        return ' '
+    
+    return best_delimiter
+
+# --- Data Ingestion ---
+
+def ingest_data(file_path):
+    """
+    Ingests data from various formats (CSV, Excel, JSON, XML, TXT).
+    Assumes some common sense in file naming or structure for initial parsing.
+    For truly 'haphazard', you'd need more advanced content-based detection.
+    """
+    file_extension = os.path.splitext(file_path)[1].lower()
+    df = pd.DataFrame()
+    raw_data = None # To store raw content for unstructured parsing
+
+    try:
+        if file_extension == '.csv' or file_extension == '.tsv':
+            delimiter = infer_delimiter(file_path)
+            df = pd.read_csv(file_path, delimiter=delimiter, encoding='utf-8', errors='replace')
+        elif file_extension == '.xlsx' or file_extension == '.xls':
+            df = pd.read_excel(file_path)
+        elif file_extension == '.json':
+            with open(file_path, 'r', encoding='utf-8') as f:
+                raw_data = json.load(f)
+            # Attempt to flatten JSON if it's a list of dicts or deeply nested
+            if isinstance(raw_data, list):
+                df = pd.json_normalize(raw_data)
+            elif isinstance(raw_data, dict):
+                df = pd.json_normalize(raw_data) # Might need more sophisticated flattening
+            else:
+                print(f"Warning: JSON structure in {file_path} is not directly tabular. Ingested as raw data.")
+                df = pd.DataFrame([raw_data]) # Wrap in a DataFrame for consistency
+        elif file_extension == '.xml':
+            tree = ET.parse(file_path)
+            root = tree.getroot()
+            # Simple XML to DataFrame conversion (may need customization for complex XML)
+            data = []
+            for child in root:
+                row = {}
+                for sub_child in child:
+                    row[sub_child.tag] = sub_child.text
+                data.append(row)
+            df = pd.DataFrame(data)
+            if df.empty: # Fallback if direct conversion fails or is not suitable
+                raw_data = ET.tostring(root, encoding='unicode')
+                print(f"Warning: XML structure in {file_path} is complex. Ingested as raw string.")
+                df = pd.DataFrame([{'raw_xml_content': raw_data}])
+        elif file_extension == '.txt':
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                raw_data = f.read()
+            # For unstructured text, you'd apply NLP techniques later
+            df = pd.DataFrame([{'raw_text_content': raw_data}])
+        else:
+            print(f"Unsupported file type: {file_extension}. Attempting to read as plain text.")
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                raw_data = f.read()
+            df = pd.DataFrame([{'raw_content': raw_data}])
+
+    except Exception as e:
+        print(f"Error ingesting {file_path}: {e}")
+        return pd.DataFrame(), None # Return empty DataFrame and None raw data
+
+    return df, raw_data
+
+# --- Data Cleaning ---
+
+def clean_dataframe(df, data_type_info, log):
+    """
+    Cleans a Pandas DataFrame based on predefined data type information and rules.
+    """
+    cleaned_df = df.copy()
+
+    for column in cleaned_df.columns:
+        original_dtype = cleaned_df[column].dtype
+        
+        # 1. Handle Missing Values
+        initial_missing = cleaned_df[column].isnull().sum()
+        if initial_missing > 0:
+            # Simple imputation strategies:
+            if pd.api.types.is_numeric_dtype(cleaned_df[column]):
+                cleaned_df[column].fillna(cleaned_df[column].mean(), inplace=True) # Mean for numeric
+            elif pd.api.types.is_object_dtype(cleaned_df[column]):
+                cleaned_df[column].fillna('UNKNOWN', inplace=True) # 'UNKNOWN' for categorical/text
+            
+            # Log missing value handling
+            final_missing = cleaned_df[column].isnull().sum()
+            if initial_missing != final_missing:
+                log['missing_values_handled'].append({
+                    'column': column,
+                    'count_before': initial_missing,
+                    'count_after': final_missing,
+                    'strategy': 'mean/UNKNOWN_imputation'
+                })
+
+        # 2. Type Conversion and Format Standardization
+        for key, info in data_type_info.items():
+            if key in column.lower(): # Basic heuristic to match column name to data type
+                # Attempt to convert to target type
+                if 'type' in info:
+                    try:
+                        if info['type'] == float and not pd.api.types.is_float_dtype(cleaned_df[column]):
+                            cleaned_df[column] = pd.to_numeric(cleaned_df[column], errors='coerce')
+                        elif info['type'] == int and not pd.api.types.is_integer_dtype(cleaned_df[column]):
+                            cleaned_df[column] = pd.to_numeric(cleaned_df[column], errors='coerce').astype('Int64') # Use Int64 for nullable int
+                        elif info['type'] == str and not pd.api.types.is_object_dtype(cleaned_df[column]):
+                            cleaned_df[column] = cleaned_df[column].astype(str)
+                        log['type_conversion'].append({'column': column, 'from': str(original_dtype), 'to': str(info['type'])})
+                    except Exception as e:
+                        log['errors'].append({'column': column, 'type': 'type_conversion', 'error': str(e)})
+
+                # Date/Time Formatting
+                if 'timestamp' in column.lower() and 'format' in info:
+                    initial_invalid_dates = cleaned_df[column].apply(lambda x: pd.to_datetime(x, errors='coerce')).isnull().sum()
+                    cleaned_df[column] = pd.to_datetime(cleaned_df[column], errors='coerce')
+                    cleaned_df[column] = cleaned_df[column].dt.strftime(info['format'])
+                    final_invalid_dates = cleaned_df[column].isnull().sum()
+                    if initial_invalid_dates != final_invalid_dates:
+                        log['data_standardization'].append({
+                            'column': column,
+                            'task': 'date_format',
+                            'issues_resolved': initial_invalid_dates - final_invalid_dates
+                        })
+                    
+                # Regex Validation and Cleaning
+                if 'regex' in info and pd.api.types.is_object_dtype(cleaned_df[column]):
+                    # Apply regex to clean or validate
+                    invalid_format_count = cleaned_df[column].apply(lambda x: not bool(re.fullmatch(info['regex'], str(x))) if pd.notna(x) else False).sum()
+                    if invalid_format_count > 0:
+                        log['data_validation'].append({
+                            'column': column,
+                            'task': 'regex_validation',
+                            'invalid_count': invalid_format_count,
+                            'regex_pattern': info['regex']
+                        })
+                        # Example cleaning: remove characters not matching regex, or set to NaN
+                        cleaned_df[column] = cleaned_df[column].apply(lambda x: re.match(info['regex'], str(x)).group(0) if pd.notna(x) and re.match(info['regex'], str(x)) else np.nan)
+
+
+        # 3. Handle Duplicates
+        num_duplicates_before = len(cleaned_df)
+        cleaned_df.drop_duplicates(inplace=True)
+        num_duplicates_after = len(cleaned_df)
+        if num_duplicates_before != num_duplicates_after:
+            log['duplicates_removed'].append({'count': num_duplicates_before - num_duplicates_after})
+
+        # 4. Outlier Detection and Treatment (Simple statistical for numeric)
+        if pd.api.types.is_numeric_dtype(cleaned_df[column]):
+            Q1 = cleaned_df[column].quantile(0.25)
+            Q3 = cleaned_df[column].quantile(0.75)
+            IQR = Q3 - Q1
+            lower_bound = Q1 - 1.5 * IQR
+            upper_bound = Q3 + 1.5 * IQR
+            
+            outliers = cleaned_df[(cleaned_df[column] < lower_bound) | (cleaned_df[column] > upper_bound)][column].count()
+            if outliers > 0:
+                log['outliers_detected'].append({
+                    'column': column,
+                    'count': outliers,
+                    'strategy': 'IQR'
+                })
+                # Example treatment: cap outliers or set to NaN
+                cleaned_df[column] = np.where(cleaned_df[column] < lower_bound, lower_bound, cleaned_df[column])
+                cleaned_df[column] = np.where(cleaned_df[column] > upper_bound, upper_bound, cleaned_df[column])
+                log['outliers_treated'].append({'column': column, 'count': outliers, 'method': 'capping'})
+
+        # 5. Inconsistency Handling & Standardization
+        if 'allowed_values' in info and pd.api.types.is_object_dtype(cleaned_df[column]):
+            # Case normalization
+            if info.get('case_normalize', False):
+                cleaned_df[column] = cleaned_df[column].str.upper().fillna(cleaned_df[column])
+                log['data_standardization'].append({'column': column, 'task': 'case_normalization'})
+            
+            # Map values to allowed set (e.g., 'Rad' -> 'RADAR')
+            # This requires a more complex mapping dictionary, or fuzzy matching
+            cleaned_df[column] = cleaned_df[column].apply(lambda x: x if x in info['allowed_values'] else 'UNKNOWN' if pd.notna(x) else x)
+            log['data_standardization'].append({'column': column, 'task': 'value_mapping'})
+
+        # 6. Anonymization (if specified in data_type_info)
+        if info.get('anonymize', False):
+            cleaned_df[column] = cleaned_df[column].apply(lambda x: anonymize_value(x))
+            log['anonymization'].append({'column': column, 'method': 'pseudonymization'})
+
+    return cleaned_df
+
+def clean_raw_text(raw_text, data_type_info, log):
+    """
+    Applies cleaning to raw, unstructured text using regex patterns defined
+    in data_type_info. This is where NLP techniques would come into play for
+    more advanced extraction and cleaning.
+    """
+    cleaned_text = raw_text
+    extracted_data = {}
+
+    log['raw_text_cleaning'] = []
+
+    # Example: Extracting known patterns from unstructured text
+    for key, info in data_type_info.items():
+        if 'regex' in info:
+            matches = re.findall(info['regex'], cleaned_text)
+            if matches:
+                extracted_data[key] = matches
+                log['raw_text_cleaning'].append({'task': f'extracted_{key}', 'matches': matches[:5]}) # Log first few matches
+
+    # Remove sensitive patterns if explicitly defined for redaction
+    if 'personnel_id' in data_type_info and data_type_info['personnel_id'].get('anonymize', False):
+        regex = data_type_info['personnel_id']['regex']
+        cleaned_text = re.sub(regex, '[PERSONNEL_ID_REDACTED]', cleaned_text)
+        log['raw_text_cleaning'].append({'task': 'redacted_personnel_ids'})
+
+    # Basic text cleaning
+    cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip() # Normalize whitespace
+    cleaned_text = re.sub(r'[^a-zA-Z0-9\s.,!?;:\-]', '', cleaned_text) # Remove special characters (customize heavily for defense reports)
+    
+    log['raw_text_cleaning'].append({'task': 'normalized_whitespace'})
+    log['raw_text_cleaning'].append({'task': 'removed_non_alphanumeric_special_chars'})
+
+
+    return cleaned_text, extracted_data
+
+# --- Main Processing Function ---
+
+def process_defense_data(file_paths):
+    """
+    Main function to ingest and clean defense data files.
+    """
+    overall_cleaned_dfs = {}
+    overall_extracted_data_from_raw = {}
+    overall_cleaning_logs = defaultdict(list)
+    
+    data_type_info = get_data_type_info()
+
+    for file_path in file_paths:
+        file_name = os.path.basename(file_path)
+        print(f"\n--- Processing: {file_name} ---")
+        
+        file_log = {
+            'file_name': file_name,
+            'ingestion_status': 'failed',
+            'missing_values_handled': [],
+            'type_conversion': [],
+            'data_standardization': [],
+            'data_validation': [],
+            'duplicates_removed': [],
+            'outliers_detected': [],
+            'outliers_treated': [],
+            'anonymization': [],
+            'raw_text_cleaning': [],
+            'errors': []
+        }
+
+        df, raw_content = ingest_data(file_path)
+        
+        if not df.empty:
+            file_log['ingestion_status'] = 'successful'
+            if 'raw_text_content' in df.columns or 'raw_xml_content' in df.columns or 'raw_content' in df.columns:
+                # If it's primarily unstructured text
+                text_col = 'raw_text_content' if 'raw_text_content' in df.columns else \
+                           'raw_xml_content' if 'raw_xml_content' in df.columns else \
+                           'raw_content' if 'raw_content' in df.columns else None
+                
+                if text_col:
+                    unstructured_text = df[text_col].iloc[0] # Assuming one large text blob per file
+                    cleaned_unstructured_text, extracted_patterns = clean_raw_text(unstructured_text, data_type_info, file_log)
+                    overall_extracted_data_from_raw[file_name] = extracted_patterns
+                    # You might save this cleaned text or extracted data
+                    print(f"Cleaned unstructured text from {file_name}. Extracted patterns: {list(extracted_patterns.keys())}")
+                    # Update the DataFrame to hold the cleaned text or extracted elements
+                    df = pd.DataFrame([{'cleaned_raw_text': cleaned_unstructured_text, **extracted_patterns}])
+                
+            else: # Structured data in DataFrame
+                print(f"Initial DataFrame shape: {df.shape}")
+                print("Initial dtypes:\n", df.dtypes)
+                cleaned_df = clean_dataframe(df, data_type_info, file_log)
+                overall_cleaned_dfs[file_name] = cleaned_df
+                print(f"Cleaned DataFrame shape: {cleaned_df.shape}")
+                print("Cleaned dtypes:\n", cleaned_df.dtypes)
+        else:
+            print(f"Could not ingest data from {file_name}.")
+            file_log['ingestion_status'] = 'failed'
+            
+        overall_cleaning_logs[file_name] = file_log
+        
+    return overall_cleaned_dfs, overall_extracted_data_from_raw, overall_cleaning_logs
+
+# --- Example Usage ---
+
+if __name__ == "__main__":
+    # Create some dummy defense-like data files for testing
+    os.makedirs('temp_defense_data', exist_ok=True)
+
+    # CSV Example (mixed types, missing, potential duplicates, inconsistent case)
+    csv_data = """Timestamp,Sensor_Type,Latitude,Longitude,Threat_Level,Unit_ID,Temperature,Personnel_ID
+    2023-10-26T10:00:00Z,RADAR,34.0522,-118.2437,HIGH,ALPHA-12345,25.5,P123456
+    2023-10-26T10:05:00Z,Sonar,34.0525,-118.2439,medium,BRAVO-67890,26.1,P789012
+    2023-10-26T10:10:00Z,Optical,34.0522,-118.2437,HIGH,ALPHA-12345,25.5,P123456
+    2023-10-26T10:15:00Z,IR,34.0530,-118.2440,low,,27.0,P345678
+    2023-10-26T10:20:00Z,OTHER,34.0531,-118.2441,CRITICAL,CHARLIE-11111,999.0,P901234
+    2023/10/26 10:25:00,RADAR,34.0532,-118.2442,HIGH,,25.8,P567890
+    """
+    with open('temp_defense_data/sensor_log.csv', 'w') as f:
+        f.write(csv_data)
+
+    # JSON Example (nested, different key names)
+    json_data = [
+        {"eventTime": "2023-10-26T11:00:00Z", "sensorDetails": {"type": "RADAR", "location": {"lat": 34.10, "lon": -118.30}}, "alertSeverity": "HIGH"},
+        {"eventTime": "2023-10-26T11:02:30Z", "sensorDetails": {"type": "SONAR", "location": {"lat": 34.11, "lon": -118.31}}, "alertSeverity": "LOW"}
+    ]
+    with open('temp_defense_data/alerts.json', 'w') as f:
+        json.dump(json_data, f, indent=4)
+
+    # XML Example (simple structure)
+    xml_data = """<missions>
+        <mission>
+            <id>M-001</id>
+            <status>ACTIVE</status>
+            <start_date>2023-01-01</start_date>
+            <description>Reconnaissance mission in Sector A.</description>
+        </mission>
+        <mission>
+            <id>M-002</id>
+            <status>COMPLETED</status>
+            <start_date>2023-01-15</start_date>
+            <description>Logistics supply run.</description>
+        </mission>
+    </missions>
+    """
+    with open('temp_defense_data/missions.xml', 'w') as f:
+        f.write(xml_data)
+
+    # Unstructured Text Example (intelligence report snippet)
+    txt_data = """
+    INTELLIGENCE REPORT - 2023-10-26
+    Subject: Activity near Bravo-78901 outpost.
+    Details: Elevated threat_level MEDIUM observed at lat:34.2000, lon:-118.5000.
+    Personnel involved: P987654. Suspected hostile elements.
+    Sensor type: IR. Further analysis required. Unit_ID: DELTA-54321.
+    Additional notes: Unspecified sensor anomalies.
+    """
+    with open('temp_defense_data/intel_report.txt', 'w') as f:
+        f.write(txt_data)
+
+    file_paths_to_process = [
+        'temp_defense_data/sensor_log.csv',
+        'temp_defense_data/alerts.json',
+        'temp_defense_data/missions.xml',
+        'temp_defense_data/intel_report.txt'
+    ]
+
+    cleaned_dfs, extracted_data_from_raw, cleaning_logs = process_defense_data(file_paths_to_process)
+
+    print("\n\n--- Cleaning Summary ---")
+    for file_name, log in cleaning_logs.items():
+        print(f"\nFile: {file_name}")
+        print(f"  Ingestion Status: {log['ingestion_status']}")
+        for key, value in log.items():
+            if key not in ['file_name', 'ingestion_status'] and value:
+                print(f"  {key.replace('_', ' ').title()}: {len(value)} entries")
+                # print(f"    Details: {value}") # Uncomment to see full log details
+
+    print("\n\n--- Cleaned DataFrames (First 5 Rows) ---")
+    for file_name, df in cleaned_dfs.items():
+        print(f"\n{file_name}:")
+        print(df.head())
+        print(df.dtypes)
+
+    print("\n\n--- Extracted Data from Raw Files ---")
+    for file_name, data in extracted_data_from_raw.items():
+        print(f"\n{file_name}:")
+        for key, value in data.items():
+            print(f"  {key}: {value}")
+
+    # Cleanup dummy files
+    import shutil
+    shutil.rmtree('temp_defense_data')
+    print("\nCleaned up temporary data files.")

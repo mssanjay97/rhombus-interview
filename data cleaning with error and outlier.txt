@@ -1,0 +1,711 @@
+import pandas as pd
+import numpy as np
+import re
+import os
+import json
+from datetime import datetime
+from collections import defaultdict
+import xml.etree.ElementTree as ET
+import hashlib # For anonymization hashing
+from scipy.stats import zscore # For Z-score outlier detection
+
+# --- 1. Schema Definition for Defense Data (Crucial for Tailored Cleaning) ---
+# This dictionary serves as the blueprint for our data cleaning strategy.
+# It defines the expected characteristics, data types, and specific cleaning rules
+# for each anticipated column in defense-related datasets (e.g., sensor logs,
+# intelligence reports, logistics data, personnel records).
+# YOU MUST CUSTOMIZE THIS SCHEMA based on the specific defense data you're working with.
+
+def get_defense_data_schema():
+    """
+    Defines the expected schema and cleaning rules for various defense data types.
+    Each key represents a 'conceptual' column name (e.g., 'timestamp', 'latitude').
+    The corresponding value is a dictionary containing detailed rules and properties
+    for that column.
+
+    This schema allows the cleaning process to be dynamic and adaptable to
+    different data sources without rewriting the core cleaning logic.
+    """
+    return {
+        'timestamp': {
+            'dtype': 'datetime64[ns]',  # Target Pandas data type for time-series operations
+            'priority_formats': ['%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%d %H:%M:%S', '%m/%d/%Y %H:%M:%S'],
+            'missing_strategy': 'drop_row', # Critical for time-series data; ensures data integrity
+            'range': (datetime(2000, 1, 1), datetime.now()), # Example: Data shouldn't be too old or in future
+            'on_error': 'set_nan' # If conversion fails, set to NaN
+        },
+        'latitude': {
+            'dtype': float,
+            'range': (-90.0, 90.0), # Valid geographic range for latitude
+            'precision': 4, # Round numerical values to 4 decimal places
+            'missing_strategy': 'impute_median', # Impute missing latitude with the median
+            'outlier_strategy': 'flag_zscore', # Flag outliers using Z-score, rather than capping
+            'zscore_threshold': 3.0, # Values beyond 3 standard deviations are considered outliers
+            'regex': r'^-?\d{1,2}(\.\d+)?$', # Basic regex for validating latitude format
+            'on_error': 'set_nan' # If conversion fails, set to NaN
+        },
+        'longitude': {
+            'dtype': float,
+            'range': (-180.0, 180.0), # Valid geographic range for longitude
+            'precision': 4,
+            'missing_strategy': 'impute_median',
+            'outlier_strategy': 'flag_zscore', # Flag outliers
+            'zscore_threshold': 3.0,
+            'regex': r'^-?\d{1,3}(\.\d+)?$', # Basic regex for validating longitude format
+            'on_error': 'set_nan'
+        },
+        'unit_id': {
+            'dtype': str,
+            'regex': r'^[A-Z]{2,5}-\d{3,6}[A-Z]?$', # Example: 'ALPHA-12345', 'NAVY-001A'
+            'case_standard': 'upper', # Convert all values to uppercase
+            'missing_strategy': 'impute_mode', # Impute with the most common unit ID
+            'allowed_prefixes': ['ALPHA', 'BRAVO', 'CHARLIE', 'DELTA', 'ECHO', 'NAVY', 'ARMY', 'AIRF'],
+            'on_error': 'set_nan' # If conversion fails or regex mismatch, set to NaN
+        },
+        'threat_level': {
+            'dtype': 'category', # Efficient for fixed sets of values
+            'allowed_values': ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL', 'UNKNOWN'], # Canonical list of valid threat levels
+            'case_standard': 'upper',
+            'missing_strategy': 'impute_mode', # Or 'set_unknown'
+            'fuzzy_map': { # Common misspellings or variations
+                'med': 'MEDIUM', 'hi': 'HIGH', 'crit': 'CRITICAL', 'low': 'LOW', 'critical danger': 'CRITICAL'
+            },
+            'on_error': 'set_unknown' # If a value doesn't map, set to 'UNKNOWN'
+        },
+        'sensor_type': {
+            'dtype': 'category',
+            'allowed_values': ['RADAR', 'SONAR', 'OPTICAL', 'IR', 'THERMAL', 'ACOUSTIC', 'OTHER'],
+            'case_standard': 'upper',
+            'missing_strategy': 'set_unknown',
+            'fuzzy_map': { 'rad': 'RADAR', 'snr': 'SONAR', 'opt': 'OPTICAL', 'infrared': 'IR' },
+            'on_error': 'set_unknown'
+        },
+        'status': {
+            'dtype': 'category',
+            'allowed_values': ['ACTIVE', 'INACTIVE', 'DEPLOYED', 'MAINTENANCE', 'ERROR', 'STANDBY', 'ARCHIVED'],
+            'case_standard': 'upper',
+            'missing_strategy': 'set_unknown',
+            'on_error': 'set_unknown'
+        },
+        'personnel_id': { # Example of sensitive data
+            'dtype': str,
+            'regex': r'^[A-Z]{1}\d{6}[A-Z]$', # Example: 'P123456A'
+            'missing_strategy': 'drop_column', # Or 'anonymize'
+            'anonymize': True, # Flag for anonymization
+            'anonymization_method': 'hash_sha256',
+            'on_error': 'set_nan'
+        },
+        'equipment_serial': {
+            'dtype': str,
+            'regex': r'^[A-Z0-9]{8,20}$',
+            'case_standard': 'upper',
+            'missing_strategy': 'set_unknown',
+            'on_error': 'set_nan'
+        },
+        'altitude': {
+            'dtype': float,
+            'range': (-500.0, 100000.0), # Example: -500ft to 100,000ft
+            'missing_strategy': 'impute_mean',
+            'outlier_strategy': 'cap_iqr', # Cap outliers using IQR method
+            'unit_conversion': {'from': 'meters', 'to': 'feet', 'factor': 3.28084},
+            'on_error': 'set_nan'
+        },
+        'temperature': { # New column for example
+            'dtype': float,
+            'range': (-50.0, 100.0), # Range for Celsius
+            'missing_strategy': 'impute_mean',
+            'outlier_strategy': 'flag_iqr', # Flag outliers using IQR
+            'on_error': 'set_nan'
+        }
+    }
+
+def anonymize_value(value, method='hash_sha256', salt='rhombus_hackathon_defense_data_salt'):
+    """
+    Applies various anonymization techniques to sensitive data values.
+    Crucial for handling PII (Personally Identifiable Information) or CUI
+    (Controlled Unclassified Information) in defense datasets, ensuring
+    compliance and protecting sensitive entities.
+
+    Args:
+        value: The data value to anonymize.
+        method (str): The anonymization strategy ('hash_sha256', 'suppress', 'mask_partial', 'generalize_date').
+        salt (str): A string added to data before hashing to prevent rainbow table attacks.
+
+    Returns:
+        The anonymized value, or np.nan if the input is missing.
+    """
+    if pd.isna(value) or value is None:
+        return np.nan
+
+    value_str = str(value)
+    try:
+        if method == 'hash_sha256':
+            return hashlib.sha256((value_str + salt).encode()).hexdigest()
+        elif method == 'suppress':
+            return '[SUPPRESSED]'
+        elif method == 'mask_partial':
+            if len(value_str) > 4:
+                return '*' * (len(value_str) - 4) + value_str[-4:]
+            return value_str
+        elif method == 'generalize_date':
+            date_obj = pd.to_datetime(value_str, errors='coerce')
+            if pd.notna(date_obj):
+                return date_obj.strftime('%Y-%m') # Generalize to Year-Month
+            return np.nan
+        else:
+            return value # Return original if method is unknown
+    except Exception as e:
+        # Log any errors during anonymization. This is less common but good practice.
+        return f"[ANONYMIZATION_ERROR_{type(e).__name__}]"
+
+# --- 2. Data Ingestion (Flexible and Robust for Various Formats) ---
+
+def ingest_data_flexible(file_path, log):
+    """
+    Ingests data from various common file formats. This function attempts to
+    intelligently read the data, providing flexibility for "haphazard" inputs.
+    It prioritizes common delimiters for CSV/TSV and performs basic flattening
+    for JSON and XML. For truly unstructured text, it loads as a raw string.
+
+    Args:
+        file_path (str): The path to the data file.
+        log (dict): A dictionary to append ingestion issues and notes.
+
+    Returns:
+        pandas.DataFrame: The ingested data as a DataFrame.
+    """
+    file_extension = os.path.splitext(file_path)[1].lower()
+    df = pd.DataFrame()
+
+    try:
+        if file_extension == '.csv' or file_extension == '.tsv':
+            # Attempt to read CSV/TSV by trying common delimiters.
+            # 'on_bad_lines='skip'' helps handle rows with too many/few columns without crashing.
+            successful_delim = None
+            for delim in [',', '\t', ';', '|']:
+                try:
+                    df = pd.read_csv(file_path, delimiter=delim, encoding='utf-8', on_bad_lines='skip')
+                    if not df.empty and df.shape[1] > 1: # Heuristic: assume valid if more than 1 column
+                        log['ingestion_issues'].append(f"Successfully ingested CSV with delimiter '{delim}'.")
+                        successful_delim = delim
+                        break
+                    else:
+                        log['ingestion_issues'].append(f"Attempt with delimiter '{delim}' resulted in too few columns or empty DF.")
+                        df = pd.DataFrame() # Reset df for next attempt
+                except UnicodeDecodeError:
+                    log['ingestion_issues'].append(f"Attempt with delimiter '{delim}' failed due to UnicodeDecodeError. Trying next.")
+                except Exception as e:
+                    log['ingestion_issues'].append(f"Attempt with delimiter '{delim}' failed: {type(e).__name__} - {e}")
+            if df.empty:
+                raise ValueError("Could not find a suitable delimiter for CSV/TSV, or file is empty/malformed.")
+
+        elif file_extension == '.xlsx' or file_extension == '.xls':
+            df = pd.read_excel(file_path)
+            log['ingestion_issues'].append("Successfully ingested Excel file.")
+
+        elif file_extension == '.json':
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                df = pd.json_normalize(data)
+                log['ingestion_issues'].append("Successfully ingested JSON list of objects.")
+            elif isinstance(data, dict):
+                df = pd.json_normalize(data)
+                log['ingestion_issues'].append("Successfully ingested JSON object (flattened).")
+            else:
+                log['ingestion_issues'].append("JSON root is not a list or dict. Attempting single-row DataFrame.")
+                df = pd.DataFrame([data])
+
+        elif file_extension == '.xml':
+            tree = ET.parse(file_path)
+            root = tree.getroot()
+            rows = []
+            # Heuristic for common item/record tags, or any direct children
+            for item in root.findall('.//item') or root.findall('.//record') or root.findall('.//*'):
+                row = {child.tag: child.text for child in item if child.text is not None}
+                if row:
+                    rows.append(row)
+            df = pd.DataFrame(rows)
+            if df.empty:
+                log['ingestion_issues'].append("XML conversion to DataFrame yielded empty result. May need custom parsing.")
+                # Fallback to raw text for potential regex extraction later
+                df = pd.DataFrame([{'raw_xml_content': ET.tostring(root, encoding='unicode')}])
+            else:
+                log['ingestion_issues'].append("Successfully ingested XML (simple parsing).")
+
+        elif file_extension == '.txt':
+            try:
+                # Try common delimiters for potential TSV-like txt files
+                temp_df = pd.read_csv(file_path, delimiter='\t', encoding='utf-8', on_bad_lines='skip')
+                if not temp_df.empty and temp_df.shape[1] > 1:
+                    df = temp_df
+                    log['ingestion_issues'].append("Successfully ingested TXT as TSV.")
+                else:
+                    raise ValueError("TXT is not a simple TSV.")
+            except Exception as e:
+                log['ingestion_issues'].append(f"TXT as TSV attempt failed: {type(e).__name__} - {e}. Reading as raw text.")
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    raw_content = f.read()
+                df = pd.DataFrame([{'raw_text_content': raw_content}])
+                log['ingestion_issues'].append("Ingested TXT as raw_text_content.")
+        else:
+            log['ingestion_issues'].append(f"Unsupported file type '{file_extension}'. Attempting as raw text.")
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                raw_content = f.read()
+            df = pd.DataFrame([{'raw_content': raw_content}])
+
+    except Exception as e:
+        log['ingestion_issues'].append(f"Overall ingestion error for {file_path}: {type(e).__name__} - {e}")
+        df = pd.DataFrame() # Ensure empty DF on catastrophic failure
+
+    return df
+
+# --- 3. Data Cleaning Core Logic ---
+
+def clean_defense_dataframe(df, schema, log):
+    """
+    Cleans a Pandas DataFrame based on the provided schema for defense data,
+    with enhanced error and outlier handling.
+
+    Args:
+        df (pandas.DataFrame): The DataFrame to be cleaned.
+        schema (dict): The schema dictionary defining cleaning rules for columns.
+        log (dict): A dictionary to append cleaning operations and issues for reporting.
+
+    Returns:
+        pandas.DataFrame: The cleaned DataFrame.
+    """
+    cleaned_df = df.copy()
+    initial_rows = len(cleaned_df)
+    log['rows_before_cleaning'] = initial_rows
+    log['columns_before_cleaning'] = list(cleaned_df.columns)
+    
+    # --- 3.1 Column Renaming (Basic Heuristic) ---
+    column_mapping = {}
+    for col in cleaned_df.columns:
+        matched = False
+        for schema_key in schema:
+            if schema_key.lower() in col.lower():
+                column_mapping[col] = schema_key
+                matched = True
+                break
+        if not matched:
+            column_mapping[col] = col
+    cleaned_df.rename(columns=column_mapping, inplace=True)
+    if column_mapping:
+        log['column_renaming'] = column_mapping
+
+    # --- 3.2 Handle Duplicates FIRST ---
+    num_duplicates_before = len(cleaned_df)
+    cleaned_df.drop_duplicates(inplace=True)
+    num_duplicates_after = len(cleaned_df)
+    if num_duplicates_before != num_duplicates_after:
+        log['duplicates_removed'].append({'count': num_duplicates_before - num_duplicates_after})
+
+    for col_name, schema_rules in schema.items():
+        if col_name in cleaned_df.columns:
+            original_dtype = cleaned_df[col_name].dtype
+            
+            # --- 3.3 Type Conversion with Enhanced Error Handling ---
+            target_dtype = schema_rules.get('dtype')
+            on_error_action = schema_rules.get('on_error', 'set_nan') # Default to setting NaN on conversion error
+
+            if target_dtype:
+                initial_nulls_before_type_conv = cleaned_df[col_name].isnull().sum()
+                try:
+                    if target_dtype == 'datetime64[ns]':
+                        # Try auto-infer first, then priority formats
+                        temp_series = pd.to_datetime(cleaned_df[col_name], errors='coerce', format=None)
+                        
+                        if temp_series.isnull().any() and 'priority_formats' in schema_rules:
+                            for fmt in schema_rules['priority_formats']:
+                                # Fill NaNs by trying to parse with the current format
+                                temp_series = temp_series.fillna(pd.to_datetime(cleaned_df[col_name], errors='coerce', format=fmt))
+                                if temp_series.isnull().sum() == 0: break
+                        cleaned_df[col_name] = temp_series
+
+                    elif target_dtype == float:
+                        cleaned_df[col_name] = pd.to_numeric(cleaned_df[col_name], errors='coerce')
+                    elif target_dtype == int:
+                        # Convert to float first to handle NaNs, then to nullable integer
+                        cleaned_df[col_name] = pd.to_numeric(cleaned_df[col_name], errors='coerce')
+                        cleaned_df[col_name] = cleaned_df[col_name].astype('Int64', errors='ignore') # 'Int64' allows NaNs
+                    elif target_dtype == str:
+                        cleaned_df[col_name] = cleaned_df[col_name].astype(str).replace('nan', np.nan)
+                    elif target_dtype == 'category':
+                        cleaned_df[col_name] = cleaned_df[col_name].astype('category')
+                    
+                    converted_nulls = cleaned_df[col_name].isnull().sum() - initial_nulls_before_type_conv
+                    if converted_nulls > 0:
+                        log['type_conversion'].append({'column': col_name, 'from': str(original_dtype), 'to': str(target_dtype), 'note': f'{converted_nulls} values coerced to NaN due to conversion errors.'})
+                    elif str(original_dtype) != str(target_dtype):
+                        log['type_conversion'].append({'column': col_name, 'from': str(original_dtype), 'to': str(target_dtype)})
+
+                except Exception as e:
+                    # Log critical type conversion failures
+                    log['errors'].append({'column': col_name, 'task': 'type_conversion', 'error': f"{type(e).__name__}: {e}", 'value_sample': cleaned_df[col_name].head(5).tolist()})
+                    if on_error_action == 'set_nan':
+                        cleaned_df[col_name] = np.nan # Set entire column to NaN on catastrophic failure
+            
+            # --- 3.4 String Standardization (Case, Regex, Fuzzy Mapping) ---
+            if cleaned_df[col_name].dtype == 'object' or cleaned_df[col_name].dtype.name == 'category':
+                # Case standardization
+                if 'case_standard' in schema_rules and pd.notna(cleaned_df[col_name]).any():
+                    try:
+                        if schema_rules['case_standard'] == 'upper':
+                            cleaned_df[col_name] = cleaned_df[col_name].astype(str).str.upper().replace('NAN', np.nan)
+                            log['data_standardization'].append({'column': col_name, 'task': 'case_upper'})
+                        elif schema_rules['case_standard'] == 'lower':
+                            cleaned_df[col_name] = cleaned_df[col_name].astype(str).str.lower().replace('nan', np.nan)
+                            log['data_standardization'].append({'column': col_name, 'task': 'case_lower'})
+                    except Exception as e:
+                        log['errors'].append({'column': col_name, 'task': 'case_standardization', 'error': f"{type(e).__name__}: {e}"})
+
+                # Regex Validation & Correction/Removal
+                if 'regex' in schema_rules:
+                    initial_valid_count = cleaned_df[col_name].notna().sum()
+                    try:
+                        # Use a vectorized operation for efficiency where possible
+                        mask_invalid = cleaned_df[col_name].astype(str).apply(lambda x: not bool(re.fullmatch(schema_rules['regex'], x)))
+                        # Exclude NaNs from being marked as invalid if they were already NaN
+                        mask_invalid = mask_invalid & cleaned_df[col_name].notna()
+
+                        invalid_count = mask_invalid.sum()
+                        if invalid_count > 0:
+                            log['data_validation'].append({'column': col_name, 'task': 'regex_mismatch_to_nan', 'count': invalid_count, 'regex': schema_rules['regex']})
+                            cleaned_df.loc[mask_invalid, col_name] = np.nan
+                    except Exception as e:
+                        log['errors'].append({'column': col_name, 'task': 'regex_validation', 'error': f"{type(e).__name__}: {e}"})
+                
+                # Fuzzy Mapping / Allowed Values
+                if 'allowed_values' in schema_rules and pd.notna(cleaned_df[col_name]).any():
+                    try:
+                        fuzzy_map = schema_rules.get('fuzzy_map', {})
+                        standard_map = {v.upper(): v for v in schema_rules['allowed_values']}
+                        for k, v in fuzzy_map.items():
+                            standard_map[k.upper()] = v
+
+                        # Vectorized apply for performance
+                        original_values = cleaned_df[col_name].astype(str).str.upper()
+                        mapped_values = original_values.map(standard_map)
+                        
+                        # Identify values that are not in the standard map AND were not NaN initially
+                        mismatched_mask = cleaned_df[col_name].notna() & mapped_values.isna() & ~original_values.isin(standard_map.keys())
+                        mismatched_count = mismatched_mask.sum()
+
+                        if mismatched_count > 0:
+                             log['data_standardization'].append({'column': col_name, 'task': 'value_standardization_fuzzy', 'mismatched_count': mismatched_count})
+                        
+                        # Apply the mapped values. For non-matches, decide based on on_error_action
+                        if on_error_action == 'set_unknown':
+                            cleaned_df[col_name] = mapped_values.fillna('UNKNOWN')
+                        else: # Default to set_nan for non-matches (beyond fuzzy map)
+                            cleaned_df[col_name] = mapped_values.fillna(np.nan)
+
+                    except Exception as e:
+                        log['errors'].append({'column': col_name, 'task': 'fuzzy_mapping', 'error': f"{type(e).__name__}: {e}"})
+
+            # --- 3.5 Missing Value Handling ---
+            missing_before = cleaned_df[col_name].isnull().sum()
+            if missing_before > 0:
+                strategy = schema_rules.get('missing_strategy', 'default')
+                try:
+                    if strategy == 'drop_row':
+                        cleaned_df.dropna(subset=[col_name], inplace=True)
+                        log['missing_values'].append({'column': col_name, 'strategy': 'drop_row', 'count': missing_before})
+                    elif strategy == 'drop_column':
+                        cleaned_df.drop(columns=[col_name], inplace=True)
+                        log['missing_values'].append({'column': col_name, 'strategy': 'drop_column', 'count': missing_before})
+                        continue # Skip further cleaning for this column
+                    elif strategy == 'impute_mean' and pd.api.types.is_numeric_dtype(cleaned_df[col_name]):
+                        mean_val = cleaned_df[col_name].mean()
+                        cleaned_df[col_name].fillna(mean_val, inplace=True)
+                        log['missing_values'].append({'column': col_name, 'strategy': 'impute_mean', 'count': missing_before, 'value': mean_val})
+                    elif strategy == 'impute_median' and pd.api.types.is_numeric_dtype(cleaned_df[col_name]):
+                        median_val = cleaned_df[col_name].median()
+                        cleaned_df[col_name].fillna(median_val, inplace=True)
+                        log['missing_values'].append({'column': col_name, 'strategy': 'impute_median', 'count': missing_before, 'value': median_val})
+                    elif strategy == 'impute_mode' and (pd.api.types.is_object_dtype(cleaned_df[col_name]) or cleaned_df[col_name].dtype.name == 'category'):
+                        mode_val = cleaned_df[col_name].mode()[0] if not cleaned_df[col_name].mode().empty else 'UNKNOWN'
+                        cleaned_df[col_name].fillna(mode_val, inplace=True)
+                        log['missing_values'].append({'column': col_name, 'strategy': 'impute_mode', 'count': missing_before, 'value': mode_val})
+                    elif strategy == 'set_unknown' and (pd.api.types.is_object_dtype(cleaned_df[col_name]) or cleaned_df[col_name].dtype.name == 'category'):
+                        cleaned_df[col_name].fillna('UNKNOWN', inplace=True)
+                        log['missing_values'].append({'column': col_name, 'strategy': 'set_unknown', 'count': missing_before})
+                    elif strategy == 'ffill':
+                         cleaned_df[col_name].fillna(method='ffill', inplace=True)
+                         log['missing_values'].append({'column': col_name, 'strategy': 'ffill', 'count': missing_before})
+                    elif strategy == 'bfill':
+                         cleaned_df[col_name].fillna(method='bfill', inplace=True)
+                         log['missing_values'].append({'column': col_name, 'strategy': 'bfill', 'count': missing_before})
+                    else: # Default: leave as NaN or fill with a general placeholder
+                        if pd.api.types.is_object_dtype(cleaned_df[col_name]) or cleaned_df[col_name].dtype.name == 'category':
+                             cleaned_df[col_name].fillna('N/A', inplace=True)
+                             log['missing_values'].append({'column': col_name, 'strategy': 'fill_na_with_N/A', 'count': missing_before})
+                        # Numeric NaNs are usually left as is if no specific strategy
+                except Exception as e:
+                    log['errors'].append({'column': col_name, 'task': 'missing_value_handling', 'error': f"{type(e).__name__}: {e}"})
+
+            # --- 3.6 Outlier Detection & Treatment ---
+            # Added more robust outlier handling strategies.
+            if pd.api.types.is_numeric_dtype(cleaned_df[col_name]) and 'outlier_strategy' in schema_rules:
+                outlier_strategy = schema_rules['outlier_strategy']
+                
+                # Hard Range Validation (primary filter, crucial for coordinates/physical limits)
+                if 'range' in schema_rules:
+                    lower_bound_hard = schema_rules['range'][0]
+                    upper_bound_hard = schema_rules['range'][1]
+                    # Identify values outside the hard range
+                    hard_outlier_mask = (cleaned_df[col_name] < lower_bound_hard) | \
+                                        (cleaned_df[col_name] > upper_bound_hard)
+                    
+                    outliers_hard_count = hard_outlier_mask.sum()
+                    if outliers_hard_count > 0:
+                        log['outliers'].append({'column': col_name, 'type': 'range_violation', 'count': outliers_hard_count, 'range': schema_rules['range']})
+                        
+                        # Decide how to treat hard range violations: cap or set to NaN
+                        if outlier_strategy == 'cap_range' or outlier_strategy == 'cap_iqr': # Cap if specified
+                             cleaned_df.loc[cleaned_df[col_name] < lower_bound_hard, col_name] = lower_bound_hard
+                             cleaned_df.loc[cleaned_df[col_name] > upper_bound_hard, col_name] = upper_bound_hard
+                             log['outliers_treated'].append({'column': col_name, 'method': 'cap_range', 'count': outliers_hard_count})
+                        else: # Default to setting to NaN if not explicit capping or flagging
+                             cleaned_df.loc[hard_outlier_mask, col_name] = np.nan
+                             log['outliers_treated'].append({'column': col_name, 'method': 'set_nan_on_range_violation', 'count': outliers_hard_count})
+                        
+                        # Apply subsequent outlier detection only on valid range values
+                        temp_series = cleaned_df[col_name].dropna()
+                    else:
+                        temp_series = cleaned_df[col_name].dropna()
+                else:
+                    temp_series = cleaned_df[col_name].dropna()
+
+                # Proceed with statistical outlier detection only on non-NaN values within range
+                if not temp_series.empty:
+                    if outlier_strategy == 'cap_iqr':
+                        Q1 = temp_series.quantile(0.25)
+                        Q3 = temp_series.quantile(0.75)
+                        IQR = Q3 - Q1
+                        lower_bound = Q1 - 1.5 * IQR
+                        upper_bound = Q3 + 1.5 * IQR
+                        
+                        iqr_outlier_mask = (cleaned_df[col_name] < lower_bound) | (cleaned_df[col_name] > upper_bound)
+                        outliers_iqr_count = iqr_outlier_mask.sum()
+
+                        if outliers_iqr_count > 0:
+                            log['outliers'].append({'column': col_name, 'type': 'iqr', 'count': outliers_iqr_count})
+                            cleaned_df.loc[cleaned_df[col_name] < lower_bound, col_name] = lower_bound
+                            cleaned_df.loc[cleaned_df[col_name] > upper_bound, col_name] = upper_bound
+                            log['outliers_treated'].append({'column': col_name, 'method': 'cap_iqr', 'count': outliers_iqr_count})
+
+                    elif outlier_strategy == 'flag_zscore' and 'zscore_threshold' in schema_rules:
+                        z_threshold = schema_rules['zscore_threshold']
+                        try:
+                            z_scores = np.abs(zscore(temp_series))
+                            zscore_outlier_mask = (np.abs(zscore(cleaned_df[col_name].dropna())) > z_threshold)
+                            outliers_zscore_count = zscore_outlier_mask.sum()
+
+                            if outliers_zscore_count > 0:
+                                # Create a flag column. This is crucial for defense data where anomalies are important.
+                                flag_col_name = f"{col_name}_is_outlier"
+                                cleaned_df[flag_col_name] = False
+                                cleaned_df.loc[cleaned_df[col_name].isin(temp_series[zscore_outlier_mask].index), flag_col_name] = True
+                                log['outliers'].append({'column': col_name, 'type': 'zscore', 'count': outliers_zscore_count, 'threshold': z_threshold})
+                                log['outliers_treated'].append({'column': col_name, 'method': 'flag_zscore', 'count': outliers_zscore_count, 'flag_column': flag_col_name})
+                                # Optionally set to NaN if flagging is not enough
+                                # cleaned_df.loc[cleaned_df[col_name].isin(temp_series[zscore_outlier_mask].index), col_name] = np.nan
+
+                        except Exception as e:
+                            log['errors'].append({'column': col_name, 'task': 'zscore_outlier_detection', 'error': f"{type(e).__name__}: {e}"})
+
+                    elif outlier_strategy == 'flag_iqr':
+                        Q1 = temp_series.quantile(0.25)
+                        Q3 = temp_series.quantile(0.75)
+                        IQR = Q3 - Q1
+                        lower_bound = Q1 - 1.5 * IQR
+                        upper_bound = Q3 + 1.5 * IQR
+                        
+                        iqr_outlier_mask = (cleaned_df[col_name] < lower_bound) | (cleaned_df[col_name] > upper_bound)
+                        outliers_iqr_count = iqr_outlier_mask.sum()
+
+                        if outliers_iqr_count > 0:
+                            flag_col_name = f"{col_name}_is_outlier"
+                            cleaned_df[flag_col_name] = False
+                            cleaned_df.loc[iqr_outlier_mask, flag_col_name] = True
+                            log['outliers'].append({'column': col_name, 'type': 'iqr_flagged', 'count': outliers_iqr_count})
+                            log['outliers_treated'].append({'column': col_name, 'method': 'flag_iqr', 'count': outliers_iqr_count, 'flag_column': flag_col_name})
+
+                # Precision rounding for numeric data (e.g., coordinates)
+                if 'precision' in schema_rules:
+                    try:
+                        cleaned_df[col_name] = np.round(cleaned_df[col_name], schema_rules['precision'])
+                        log['data_standardization'].append({'column': col_name, 'task': 'precision_rounding', 'precision': schema_rules['precision']})
+                    except Exception as e:
+                        log['errors'].append({'column': col_name, 'task': 'precision_rounding', 'error': f"{type(e).__name__}: {e}"})
+
+            # --- 3.7 Unit Conversion ---
+            if 'unit_conversion' in schema_rules and pd.api.types.is_numeric_dtype(cleaned_df[col_name]):
+                conv_info = schema_rules['unit_conversion']
+                if conv_info['from'] != conv_info['to']:
+                    try:
+                        cleaned_df[col_name] = cleaned_df[col_name] * conv_info['factor']
+                        log['data_standardization'].append({'column': col_name, 'task': 'unit_conversion', 'from': conv_info['from'], 'to': conv_info['to']})
+                    except Exception as e:
+                        log['errors'].append({'column': col_name, 'task': 'unit_conversion', 'error': f"{type(e).__name__}: {e}"})
+
+            # --- 3.8 Anonymization ---
+            if schema_rules.get('anonymize', False):
+                method = schema_rules.get('anonymization_method', 'hash_sha256')
+                try:
+                    cleaned_df[col_name] = cleaned_df[col_name].apply(lambda x: anonymize_value(x, method))
+                    log['anonymization'].append({'column': col_name, 'method': method})
+                except Exception as e:
+                    log['errors'].append({'column': col_name, 'task': 'anonymization', 'error': f"{type(e).__name__}: {e}"})
+
+    # Final row count after cleaning (due to potential row drops)
+    log['rows_after_cleaning'] = len(cleaned_df)
+    log['columns_after_cleaning'] = list(cleaned_df.columns)
+    
+    return cleaned_df
+
+def process_all_defense_data_files(file_paths):
+    """
+    Orchestrates the ingestion and cleaning of multiple defense data files.
+    This is the main entry point for the cleaning pipeline.
+
+    Args:
+        file_paths (list): A list of file paths to process.
+
+    Returns:
+        tuple: A tuple containing:
+            - dict: A dictionary where keys are file names and values are the cleaned Pandas DataFrames.
+            - dict: A dictionary where keys are file names and values are detailed cleaning reports (logs).
+    """
+    overall_cleaned_dataframes = {}
+    overall_cleaning_reports = {}
+    
+    schema = get_defense_data_schema()
+
+    for file_path in file_paths:
+        file_name = os.path.basename(file_path)
+        print(f"\n--- Processing file: {file_name} ---")
+        
+        # Initialize a detailed log for each file
+        file_report = {
+            'file_name': file_name,
+            'ingestion_issues': [],
+            'rows_before_cleaning': 0,
+            'rows_after_cleaning': 0,
+            'columns_before_cleaning': [],
+            'columns_after_cleaning': [],
+            'column_renaming': {},
+            'duplicates_removed': [],
+            'missing_values': [],
+            'type_conversion': [],
+            'data_standardization': [],
+            'data_validation': [],
+            'outliers': [],
+            'outliers_treated': [],
+            'anonymization': [],
+            'errors': [] # Centralized error logging
+        }
+
+        # Pass the file_report log directly to ingestion for comprehensive logging
+        df = ingest_data_flexible(file_path, file_report)
+
+        if not df.empty:
+            print(f"Successfully ingested. Initial shape: {df.shape}")
+            
+            raw_content_cols = [col for col in df.columns if 'raw_text_content' in col or 'raw_xml_content' in col or 'raw_content' in col]
+            
+            if raw_content_cols:
+                print(f"File contains raw/unstructured content columns: {raw_content_cols}")
+                file_report['note'] = 'File contains primarily unstructured data. Core cleaning for structured columns might be limited or skipped for these raw content columns. Further NLP analysis is recommended.'
+                overall_cleaned_dataframes[file_name] = df
+            else:
+                cleaned_df = clean_defense_dataframe(df, schema, file_report)
+                overall_cleaned_dataframes[file_name] = cleaned_df
+                print(f"Cleaning complete. Final shape: {cleaned_df.shape}")
+        else:
+            print(f"Failed to ingest {file_name}. Skipping cleaning for this file.")
+            
+        overall_cleaning_reports[file_name] = file_report
+        
+    return overall_cleaned_dataframes, overall_cleaning_reports
+
+# --- Example Usage ---
+if __name__ == "__main__":
+    # Create a temporary directory for dummy data
+    temp_dir = 'temp_defense_data_v2'
+    os.makedirs(temp_dir, exist_ok=True)
+
+    # --- Dummy Data Generation (with more issues to test handling) ---
+
+    # 1. CSV - Mixed, missing, inconsistent, outliers, different date formats, malformed row
+    csv_data = """Timestamp,Sensor_Type,Lat,Long,Threat_Level,UnitID,Temperature_C,PersonnelID,Altitude
+2024-07-16T10:00:00Z,RADAR,34.0522,-118.2437,HIGH,ALPHA-12345,25.5,P123456A,100
+2024-07-16 10:05:00,sonar,34.0525,-118.2439,medium,BRAVO-67890,26.1,P789012B,200
+07/16/2024 10:10:00,OPT,34.0522,-118.2437,HIGH,ALPHA-12345,25.5,P123456A,100
+2024-07-16T10:15:00Z,IR,34.0530,-118.2440,low,,27.0,P345678C,
+2024-07-16 10:20:00,OTHER,34.0531,-118.2441,CRITICAL,CHARLIE-11111,999.0,P901234D,500000.0
+2024-07-16 10:25:00,RADAR,34.0532,-118.2442,HIGH,,25.8,P567890E,150
+2024-07-16T10:30:00Z,RADAR,95.0,-190.0,LOW,DELTA-22222,-500.0,P000000X,50
+2024-07-16 10:35:00Z,RADAR,InvalidLat,-118.2444,HIGH,FOXTROT-33333,40.0,P222222F,300
+2024-07-16 10:40:00Z,OPTICAL,34.0535,-118.2445,CRITICAL,GOLF-44444,28.0,P333333G,200000.0
+2024-07-16 10:45:00Z,RADAR,34.0536,-118.2446,HIGH,HOTEL-55555,1000.0,P444444H,100
+This is a malformed row,2024-07-16 10:50:00Z,SENSOR,1,2,HIGH,UNIT-ID,TEMP,PERSONNEL,ALT
+"""
+    with open(os.path.join(temp_dir, 'sensor_readings_enhanced.csv'), 'w') as f:
+        f.write(csv_data)
+
+    # 2. JSON - Nested structure, different key names
+    json_data = [
+        {"event_ts": "2024-07-16T11:00:00Z", "sensor_details": {"type_id": "RADAR", "location": {"latitude_coord": 34.10, "longitude_coord": -118.30}}, "alert_severity": "HIGH", "temperature": 20},
+        {"event_ts": "2024-07-16T11:02:30Z", "sensor_details": {"type_id": "SONAR", "location": {"latitude_coord": 34.11, "longitude_coord": -118.31}}, "alert_severity": "LOW", "status": "ACTIVE", "temperature": 15},
+        {"event_ts": "2024-07-16T11:05:00Z", "sensor_details": {"type_id": "IR", "location": {"latitude_coord": 34.12, "longitude_coord": -118.32}}, "alert_severity": "CRITICAL", "temperature": 500} # Outlier temp
+    ]
+    with open(os.path.join(temp_dir, 'alerts_enhanced.json'), 'w') as f:
+        json.dump(json_data, f, indent=4)
+
+    # List of files to process
+    file_paths_to_process = [
+        os.path.join(temp_dir, 'sensor_readings_enhanced.csv'),
+        os.path.join(temp_dir, 'alerts_enhanced.json')
+    ]
+
+    # Run the cleaning process
+    cleaned_dfs, cleaning_reports = process_all_defense_data_files(file_paths_to_process)
+
+    # --- Output Summary ---
+    print("\n\n=== OVERALL CLEANING SUMMARY ===")
+    for file_name, report in cleaning_reports.items():
+        print(f"\n--- Report for {file_name} ---")
+        print(f"  Ingestion Issues: {report['ingestion_issues']}")
+        print(f"  Rows (Before -> After): {report['rows_before_cleaning']} -> {report['rows_after_cleaning']}")
+        print(f"  Columns (Before -> After): {report['columns_before_cleaning']} -> {report['columns_after_cleaning']}")
+        if report['column_renaming']: print(f"  Column Renaming: {report['column_renaming']}")
+        if report['duplicates_removed']: print(f"  Duplicates Removed: {report['duplicates_removed']}")
+        if report['missing_values']: print(f"  Missing Values Handled: {report['missing_values']}")
+        if report['type_conversion']: print(f"  Type Conversions: {report['type_conversion']}")
+        if report['data_standardization']: print(f"  Data Standardization: {report['data_standardization']}")
+        if report['data_validation']: print(f"  Data Validations: {report['data_validation']}")
+        if report['outliers']: print(f"  Outliers Detected: {report['outliers']}")
+        if report['outliers_treated']: print(f"  Outliers Treated: {report['outliers_treated']}")
+        if report['anonymization']: print(f"  Anonymized Columns: {report['anonymization']}")
+        if report['errors']: print(f"  Errors During Cleaning: {report['errors']}")
+        if 'note' in report: print(f"  Note: {report['note']}")
+
+    print("\n\n=== CLEANED DATAFRAMES (First 5 Rows & dtypes) ===")
+    for file_name, df in cleaned_dfs.items():
+        print(f"\n--- {file_name} ---")
+        if not df.empty:
+            print("Head:")
+            print(df.head(10)) # Print more rows to see outlier flags
+            print("\nData Types:")
+            print(df.dtypes)
+        else:
+            print("DataFrame is empty.")
+
+    # Cleanup temporary files
+    import shutil
+    shutil.rmtree(temp_dir)
+    print(f"\nCleaned up temporary directory: {temp_dir}")
